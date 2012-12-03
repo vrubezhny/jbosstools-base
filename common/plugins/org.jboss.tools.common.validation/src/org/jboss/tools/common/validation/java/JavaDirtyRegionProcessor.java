@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMember;
@@ -58,6 +59,7 @@ import org.jboss.tools.common.validation.CommonValidationPlugin;
 import org.jboss.tools.common.validation.ITypedReporter;
 import org.jboss.tools.common.validation.TempMarkerManager;
 import org.jboss.tools.common.validation.ValidationMessage;
+import org.jboss.tools.common.validation.java.ProjectCapabilitiesService.IProjectCapabilitiesListener;
 
 /**
  * As-You-Type validation Java files
@@ -67,15 +69,16 @@ import org.jboss.tools.common.validation.ValidationMessage;
  */
 @SuppressWarnings("restriction")
 final public class JavaDirtyRegionProcessor extends
-			DirtyRegionProcessor {
+			DirtyRegionProcessor implements IProjectCapabilitiesListener {
 
 	private ITextEditor fEditor;
 	private IDocument fDocument;
 	private IValidationContext fHelper;
 	private JavaProblemReporter fReporter;
-	private AsYouTypeValidatorManager fValidatorManager;
+	private AsYouTypeValidatorManager fValidatorManager = new AsYouTypeValidatorManager();
 
 	private boolean fDocumentJustSetup = false;
+	private boolean fShouldReValidateAll = false;
 	private boolean fIsCanceled = false;
 	private boolean fInRewriteSession = false;
 	private IDocumentRewriteSessionListener fDocumentRewriteSessionListener = new DocumentRewriteSessionListener();
@@ -140,6 +143,10 @@ final public class JavaDirtyRegionProcessor extends
 			fCompilationUnit = (fFile != null ? EclipseUtil.getCompilationUnit(fFile) : null);
 		}
 
+		public IProject getProject() {
+			return fFile == null ? null : fFile.getProject();
+		}
+		
 		protected IAnnotationModel getAnnotationModel() {
 			final IDocumentProvider documentProvider= fEditor.getDocumentProvider();
 			if (documentProvider == null) {
@@ -379,14 +386,21 @@ final public class JavaDirtyRegionProcessor extends
 			if (fDocument instanceof IDocumentExtension4) {
 				((IDocumentExtension4) fDocument).addDocumentRewriteSessionListener(fDocumentRewriteSessionListener);
 			}
-			if (fValidatorManager == null) {
-				fValidatorManager = new AsYouTypeValidatorManager();
-			}
 
 			fValidatorManager.connect(fDocument);
 
 			if (fReporter != null) {
+				IProject oldProject = fReporter.getProject();
 				fReporter.update();
+				IProject newProject = fReporter.getProject();
+				
+				if (oldProject != newProject) {
+					if (oldProject != null)
+						ProjectCapabilitiesService.getDefault().removeProjectCapabilitiesListener(oldProject, this);
+
+					if (newProject != null)
+						ProjectCapabilitiesService.getDefault().addProjectCapabilitiesListener(newProject, this);
+				}
 			}
 		}
 		fDocumentJustSetup = true;
@@ -395,12 +409,17 @@ final public class JavaDirtyRegionProcessor extends
 	@Override
 	public void install(ITextViewer textViewer) {
 		super.install(textViewer);
+
+		if (fReporter != null && fReporter.getProject() != null) {
+			ProjectCapabilitiesService.getDefault().addProjectCapabilitiesListener(fReporter.getProject(), this);
+		}
 	}
 
 	@Override
 	public void uninstall() {
 		fIsCanceled = true;
 		if(fReporter != null) {
+			ProjectCapabilitiesService.getDefault().removeProjectCapabilitiesListener(fReporter.getProject(), this);
 			fReporter.clearAllAnnotations();
 			fReporter.setCanceled(true);
 		}
@@ -486,32 +505,59 @@ final public class JavaDirtyRegionProcessor extends
 		}
 	}
 
+	boolean fInReValidation = false;
 	@Override
 	protected void endProcessing() {
-		if (fValidatorManager == null || fReporter == null || fStartPartitionsToProcess == -1 || fEndPartitionsToProcess == -1) 
+		if (fReporter == null || fStartPartitionsToProcess == -1 || fEndPartitionsToProcess == -1) 
 			return;
 
-		fReporter.clearRegions();
-		if (fPartitionsToProcess != null && !fPartitionsToProcess.isEmpty()) {
-			List<IRegion> regions = Arrays.asList(fPartitionsToProcess.toArray(new IRegion[fPartitionsToProcess.size()]));
-			fReporter.setRegions(regions);
-			fValidatorManager.validateString(
-					regions, 
+		boolean forceValidateAll = false;
+		synchronized (this) {
+			forceValidateAll = fShouldReValidateAll;
+			fShouldReValidateAll = false;
+		}
+
+		if (forceValidateAll) {
+			if (fValidatorManager != null && fDocument != null) {
+				fValidatorManager.disconnect(fDocument);
+				fReporter.update();
+				fReporter.removeAllMessages();
+				fReporter.clearRegions();
+				fValidatorManager.connect(fDocument);
+
+				// At the moment we're sure that all the queued dirty regions are taken away from the queue. So...
+				beginProcessing();
+				// Reset the region to be processed to the whole document's content
+				process(new DirtyRegion(0, fDocument.getLength(), DirtyRegion.INSERT, fDocument.get()));
+			}
+		}
+		
+		if (fValidatorManager != null) {
+			fReporter.clearRegions();
+			boolean processed = false;
+			if (fPartitionsToProcess != null && !fPartitionsToProcess.isEmpty()) {
+				processed = true;
+				List<IRegion> regions = Arrays.asList(fPartitionsToProcess.toArray(new IRegion[fPartitionsToProcess.size()]));
+				fReporter.setRegions(regions);
+				fValidatorManager.validateString(regions, fHelper, fReporter);
+				fReporter.finishReporting();
+			} 
+			
+			if ((forceValidateAll && !processed) || isJavaElementValidationRequired()) {
+				processed = true; // Just for sure
+				// We should not to validate 
+				// an element in case of at lease one string is validated,
+				// because the string validation performs the validation of an element
+				// as well
+				fValidatorManager.validateJavaElement(
+					Arrays.asList(
+						new IRegion[] {
+							new Region(fStartRegionToProcess, fEndRegionToProcess - fStartRegionToProcess)
+						}), 
 					fHelper, fReporter);
-			fReporter.finishReporting();
-		} else if (isJavaElementValidationRequired()) {
-			// The 'else' is added here due to not to validate 
-			// an element in case of at lease one string is validated,
-			// because the string validation performs the validation of an element
-			// as well
-			fValidatorManager.validateJavaElement(
-				Arrays.asList(
-					new IRegion[] {
-						new Region(fStartRegionToProcess, fEndRegionToProcess - fStartRegionToProcess)
-					}), 
-				fHelper, fReporter);
-			fReporter.finishReporting();
-		} 
+				fReporter.finishReporting();
+			}
+		}
 	}
 
 	private boolean isJavaElementValidationRequired() {
@@ -620,6 +666,14 @@ final public class JavaDirtyRegionProcessor extends
 		return !(IJavaPartitions.JAVA_STRING.equals(type) || IJavaPartitions.JAVA_CHARACTER.equals(type) ||
 				IJavaPartitions.JAVA_SINGLE_LINE_COMMENT.equals(type) || 
 				IJavaPartitions.JAVA_MULTI_LINE_COMMENT.equals(type) || IJavaPartitions.JAVA_DOC.equals(type));
+	}
+	
+	public void projectCapabilitiesChanged(String[] naturesAdded, String[] naturesRemoved) {
+		synchronized (this) {
+			fShouldReValidateAll = true;
+		}
+		// Queue the fake DirtyRegion due to start the processing
+		processDirtyRegion(new DirtyRegion(0, fDocument.getLength(), DirtyRegion.INSERT, fDocument.get()));
 	}
 	
 }
